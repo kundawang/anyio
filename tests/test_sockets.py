@@ -827,6 +827,84 @@ class TestTCPStream:
             await SocketStream.from_socket(sock_or_fd)
 
 
+class TestAsyncioSocketStream:
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_send_after_cancellation_waits_for_paused_transport(self) -> None:
+        """
+        Test that a send() following a cancelled send() waits for the paused
+        transport to drain instead of handing more data to it.
+        """
+        from anyio._backends._asyncio import SocketStream as AsyncioSocketStream
+        from anyio._backends._asyncio import StreamProtocol
+
+        written: list[bytes] = []
+
+        class FakeTransport:
+            """
+            Simulates an asyncio transport that pauses the protocol while its write
+            buffer is non-empty, like asyncio itself does.
+            """
+
+            paused = False
+
+            def set_write_buffer_limits(self, high: int) -> None:
+                pass
+
+            def get_extra_info(self, name: str) -> Any:
+                return None
+
+            def is_closing(self) -> bool:
+                return False
+
+            def write(self, data: bytes) -> None:
+                if self.paused:
+                    pytest.fail("wrote to a paused transport")
+
+                written.append(data)
+                self.paused = True
+                protocol.pause_writing()
+
+            def drain(self) -> None:
+                self.paused = False
+                protocol.resume_writing()
+
+            def write_eof(self) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        protocol = StreamProtocol()
+        transport = FakeTransport()
+        protocol.connection_made(cast(Any, transport))
+        stream = AsyncioSocketStream(cast(Any, transport), protocol)
+
+        # The transport pauses itself during write(), so this send() blocks waiting
+        # for the transport to drain; cancel it there, leaving the transport paused
+        async with create_task_group() as tg:
+            tg.start_soon(stream.send, b"first")
+            await wait_all_tasks_blocked()
+            tg.cancel_scope.cancel()
+
+        assert transport.paused
+        assert not protocol.write_event.is_set()
+
+        # The next send() must wait for the transport to drain instead of piling
+        # its data onto the paused transport's buffer
+        async with create_task_group() as tg:
+            tg.start_soon(stream.send, b"second")
+            await wait_all_tasks_blocked()
+            assert written == [b"first"]
+
+            # Let the transport drain; the send() may now write, which pauses the
+            # transport again, so drain it once more to let the send() complete
+            transport.drain()
+            await wait_all_tasks_blocked()
+            transport.drain()
+
+        assert written == [b"first", b"second"]
+
+
 @pytest.mark.network
 class TestTCPListener:
     async def test_extra_attributes(self, family: AnyIPAddressFamily) -> None:
