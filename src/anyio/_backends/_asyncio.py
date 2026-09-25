@@ -1018,6 +1018,21 @@ class TaskGroup(abc.TaskGroup):
         # scope here.
         try:
             await future
+        except CancelledError:
+            if future.done() and not future.cancelled():
+                # The task reported startup before the cancellation was
+                # delivered, so deliver the started value to the caller and let
+                # the cancellation take effect at the next checkpoint, matching
+                # the semantics of the Trio backend
+                pass
+            else:
+                if handle.status is TaskHandle.Status.PENDING:
+                    # Cancel the task and wait for it to exit before returning
+                    handle.cancel()
+                    with CancelScope(shield=True):
+                        await handle.wait()
+
+                raise
         except BaseException:
             if handle.status is TaskHandle.Status.PENDING:
                 # Cancel the task and wait for it to exit before returning

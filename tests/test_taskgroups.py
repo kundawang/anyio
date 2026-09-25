@@ -308,6 +308,29 @@ async def test_start_cancelled() -> None:
     assert not finished
 
 
+async def test_start_cancelled_after_started_call() -> None:
+    """
+    Test that the started value is delivered to the caller of start() even if
+    the enclosing cancel scope was cancelled while start() was waiting, and
+    that the cancellation takes effect at the next checkpoint instead.
+
+    """
+
+    async def taskfunc(*, task_status: TaskStatus[str]) -> None:
+        task_status.started("foo")
+        cancel_scope.cancel()
+        await sleep_forever()
+
+    async with create_task_group() as tg:
+        with CancelScope() as cancel_scope:
+            value = await tg.start(taskfunc)
+            assert value == "foo"
+            with pytest.raises(get_cancelled_exc_class()):
+                await checkpoint()
+
+        tg.cancel_scope.cancel()
+
+
 @pytest.mark.parametrize("anyio_backend", asyncio_params)
 async def test_start_native_host_cancelled() -> None:
     started = finished = False
@@ -330,6 +353,28 @@ async def test_start_native_host_cancelled() -> None:
 
     assert started
     assert not finished
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_start_native_cancelled_after_started_call() -> None:
+    """
+    Test that the started value is delivered to the caller of start() even if
+    the host task was natively cancelled while start() was waiting.
+
+    """
+    host_task = None
+
+    async def taskfunc(*, task_status: TaskStatus[str]) -> None:
+        task_status.started("foo")
+        assert host_task is not None
+        host_task.cancel()
+        await sleep_forever()
+
+    host_task = asyncio.current_task()
+    async with create_task_group() as tg:
+        value = await tg.start(taskfunc)
+        assert value == "foo"
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.parametrize("anyio_backend", asyncio_params)
