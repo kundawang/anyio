@@ -1200,21 +1200,30 @@ class Process(abc.Process):
         with CancelScope(shield=True) as scope:
             # We need to close the underlying pipe_transports as well to allow a
             # process blocking on full buffers to receive SIGPIPE and exit.
-            if self._stdin:
-                await self._stdin.aclose()
-                if pipe := self._transport.get_pipe_transport(0):
-                    pipe.close()
-            if self._stdout:
-                await self._stdout.aclose()
-                if pipe := self._transport.get_pipe_transport(1):
-                    pipe.close()
-            if self._stderr:
-                await self._stderr.aclose()
-                if pipe := self._transport.get_pipe_transport(2):
-                    pipe.close()
+            # The shield does not stop cancellation requests made directly to the
+            # asyncio task (e.g. via Task.cancel() or asyncio.timeout()), so make
+            # sure every stream gets closed even if one is delivered here.
+            cancelled: CancelledError | None = None
+            for stream, fd in (
+                (self._stdin, 0),
+                (self._stdout, 1),
+                (self._stderr, 2),
+            ):
+                if stream is not None:
+                    try:
+                        await stream.aclose()
+                    except CancelledError as exc:
+                        if cancelled is None:
+                            cancelled = exc
+
+                    if pipe := self._transport.get_pipe_transport(fd):
+                        pipe.close()
 
             scope.shield = False
             try:
+                if cancelled is not None:
+                    raise cancelled
+
                 await self.wait()
             except BaseException:
                 scope.shield = True

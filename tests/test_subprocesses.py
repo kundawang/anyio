@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import platform
 import sys
+from asyncio import CancelledError
 from collections.abc import Callable
 from pathlib import Path
 from subprocess import DEVNULL, CalledProcessError
@@ -24,6 +26,8 @@ from anyio import (
 )
 from anyio._core._eventloop import get_async_backend
 from anyio.streams.buffered import BufferedByteReceiveStream
+
+from .conftest import asyncio_params
 
 
 @pytest.mark.parametrize(
@@ -272,6 +276,58 @@ async def test_process_aexit_cancellation_closes_standard_streams() -> None:
             [sys.executable, "-c", "import time; time.sleep(1)"]
         ) as process:
             scope.cancel()
+
+    assert process.stdin is not None
+
+    with pytest.raises(ClosedResourceError):
+        await process.stdin.send(b"foo")
+
+    assert process.stdout is not None
+
+    with pytest.raises(ClosedResourceError):
+        await process.stdout.receive(1)
+
+    assert process.stderr is not None
+
+    with pytest.raises(ClosedResourceError):
+        await process.stderr.receive(1)
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_process_aexit_task_cancellation_doesnt_orphan_process() -> None:
+    """
+    Ensures that open_process.__aexit__() doesn't leave behind an orphan process
+    when the host task is cancelled directly (e.g. via asyncio.Task.cancel() or
+    asyncio.timeout()) while the standard streams are being closed.
+
+    """
+    process = await open_process([sys.executable, "-c", "import time; time.sleep(1)"])
+    task = asyncio.current_task()
+    assert task is not None
+    asyncio.get_running_loop().call_soon(task.cancel)
+    with pytest.raises(CancelledError):
+        async with process:
+            pass
+
+    assert process.returncode is not None
+    assert process.returncode != 0
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_process_aexit_task_cancellation_closes_standard_streams() -> None:
+    """
+    Ensures that open_process.__aexit__() closes the standard streams even when
+    the host task is cancelled directly (e.g. via asyncio.Task.cancel() or
+    asyncio.timeout()) while the streams are being closed.
+
+    """
+    process = await open_process([sys.executable, "-c", "import time; time.sleep(1)"])
+    task = asyncio.current_task()
+    assert task is not None
+    asyncio.get_running_loop().call_soon(task.cancel)
+    with pytest.raises(CancelledError):
+        async with process:
+            pass
 
     assert process.stdin is not None
 
