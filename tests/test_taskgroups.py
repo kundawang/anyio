@@ -357,6 +357,25 @@ async def test_start_native_child_cancelled() -> None:
 
 
 @pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_start_native_cancel_after_started() -> None:
+    """
+    Test that the value passed to started() is delivered to the caller of
+    start() even if the caller is cancelled before it gets a chance to process
+    it, matching the semantics of the trio backend.
+    """
+    host_task = asyncio.current_task()
+
+    async def taskfunc(*, task_status: TaskStatus[str]) -> None:
+        task_status.started("foo")
+        # Cancel the caller before it gets a chance to process the started value
+        cast(asyncio.Task, host_task).cancel()
+
+    async with create_task_group() as tg:
+        value = await tg.start(taskfunc)
+        assert value == "foo"
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
 async def test_propagate_native_cancellation_from_taskgroup() -> None:
     async def taskfunc() -> None:
         async with create_task_group() as tg:

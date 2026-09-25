@@ -29,6 +29,11 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Fixed ``TaskGroup.start()`` on the asyncio backend raising ``CancelledError`` and
+  losing the value passed to ``task_status.started()`` when the calling task was
+  cancelled after the child task had already reported startup; the started value is
+  now delivered to the caller and cancellation takes effect at the next checkpoint,
+  matching the trio backend
 
 **4.15.1**
 

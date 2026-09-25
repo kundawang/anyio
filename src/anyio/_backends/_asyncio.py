@@ -1019,13 +1019,19 @@ class TaskGroup(abc.TaskGroup):
         try:
             await future
         except BaseException:
-            if handle.status is TaskHandle.Status.PENDING:
+            if not future.done() or future.cancelled():
                 # Cancel the task and wait for it to exit before returning
-                handle.cancel()
-                with CancelScope(shield=True):
-                    await handle.wait()
+                if handle.status is TaskHandle.Status.PENDING:
+                    handle.cancel()
+                    with CancelScope(shield=True):
+                        await handle.wait()
 
-            raise
+                raise
+
+            # The task already called started() (or crashed) before the
+            # cancellation could be delivered, so deliver the outcome to the
+            # caller and let any cancellation take effect at the next
+            # checkpoint, matching the semantics of the trio backend
 
         if return_handle:
             handle._start_value = future.result()
