@@ -4,10 +4,11 @@ import os
 import platform
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from subprocess import DEVNULL, CalledProcessError
 from textwrap import dedent
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from pytest_mock.plugin import MockerFixture
@@ -24,6 +25,9 @@ from anyio import (
 )
 from anyio._core._eventloop import get_async_backend
 from anyio.streams.buffered import BufferedByteReceiveStream
+
+if TYPE_CHECKING:
+    from anyio.abc import Process
 
 
 @pytest.mark.parametrize(
@@ -273,6 +277,76 @@ async def test_process_aexit_cancellation_closes_standard_streams() -> None:
         ) as process:
             scope.cancel()
 
+    assert process.stdin is not None
+
+    with pytest.raises(ClosedResourceError):
+        await process.stdin.send(b"foo")
+
+    assert process.stdout is not None
+
+    with pytest.raises(ClosedResourceError):
+        await process.stdout.receive(1)
+
+    assert process.stderr is not None
+
+    with pytest.raises(ClosedResourceError):
+        await process.stderr.receive(1)
+
+
+async def cancel_task_exiting_process_context() -> Process:
+    """
+    Run a subprocess context manager in a new asyncio task, cancel the task
+    while it is exiting the context manager and return the process object.
+    """
+    import asyncio
+
+    process = await open_process([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    async def run() -> None:
+        async with process:
+            pass
+
+    task = asyncio.create_task(run())
+    # Let the task run up to the point where it is closing the process
+    await asyncio.sleep(0)
+    task.cancel()
+    with fail_after(5):
+        with suppress(asyncio.CancelledError):
+            await task
+
+    return process
+
+
+async def test_process_exit_task_cancellation_kills_process(
+    anyio_backend_name: str,
+) -> None:
+    """
+    Ensure that cancelling the host task directly (e.g. via Task.cancel() or
+    asyncio.timeout()) while the process context manager is exiting does not
+    leave behind an orphaned subprocess.
+
+    """
+    if anyio_backend_name != "asyncio":
+        pytest.skip("cancelling tasks directly is only possible on asyncio")
+
+    process = await cancel_task_exiting_process_context()
+    assert process.returncode is not None
+    assert process.returncode != 0
+
+
+async def test_process_exit_task_cancellation_closes_standard_streams(
+    anyio_backend_name: str,
+) -> None:
+    """
+    Ensure that cancelling the host task directly (e.g. via Task.cancel() or
+    asyncio.timeout()) while the process context manager is exiting closes the
+    standard streams of the subprocess.
+
+    """
+    if anyio_backend_name != "asyncio":
+        pytest.skip("cancelling tasks directly is only possible on asyncio")
+
+    process = await cancel_task_exiting_process_context()
     assert process.stdin is not None
 
     with pytest.raises(ClosedResourceError):

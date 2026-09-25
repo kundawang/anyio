@@ -29,6 +29,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Fixed ``Process.aclose()`` on the asyncio backend leaving the subprocess running
+  and its standard streams unclosed when the surrounding task was cancelled directly
+  by asyncio (e.g. via ``Task.cancel()`` or ``asyncio.timeout()``) while the process
+  context manager was exiting
 
 **4.15.1**
 

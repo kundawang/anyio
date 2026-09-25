@@ -381,6 +381,36 @@ def is_anyio_cancellation(exc: CancelledError) -> bool:
         return False
 
 
+def _cancellation_in_flight() -> bool:
+    """
+    Return ``True`` if a cancellation is currently being propagated in this task.
+
+    This detects cancellations delivered directly by asyncio (e.g. via
+    ``Task.cancel()`` or :func:`asyncio.timeout`) which, unlike cancellations
+    requested via AnyIO cancel scopes, cannot be intercepted at checkpoints.
+
+    """
+    exc: BaseException | None = (
+        sys.exception() if sys.version_info >= (3, 11) else sys.exc_info()[1]
+    )
+    while True:
+        if isinstance(exc, CancelledError):
+            return True
+
+        if isinstance(exc, BaseExceptionGroup):
+            exc = next(
+                (
+                    item
+                    for item in exc.exceptions
+                    if isinstance(item, (CancelledError, BaseExceptionGroup))
+                ),
+                None,
+            )
+            continue
+
+        return False
+
+
 class CancelScope(BaseCancelScope):
     __slots__ = (
         "_active",
@@ -1200,18 +1230,36 @@ class Process(abc.Process):
         with CancelScope(shield=True) as scope:
             # We need to close the underlying pipe_transports as well to allow a
             # process blocking on full buffers to receive SIGPIPE and exit.
-            if self._stdin:
-                await self._stdin.aclose()
-                if pipe := self._transport.get_pipe_transport(0):
-                    pipe.close()
-            if self._stdout:
-                await self._stdout.aclose()
-                if pipe := self._transport.get_pipe_transport(1):
-                    pipe.close()
-            if self._stderr:
-                await self._stderr.aclose()
-                if pipe := self._transport.get_pipe_transport(2):
-                    pipe.close()
+            # Keep closing the remaining streams even if the cleanup gets
+            # interrupted, as can happen with cancellations delivered directly
+            # by asyncio (e.g. via Task.cancel() or asyncio.timeout()) which
+            # cancel scopes cannot shield against.
+            cleanup_error: BaseException | None = None
+            for fd, stream in enumerate((self._stdin, self._stdout, self._stderr)):
+                try:
+                    if stream is not None:
+                        await stream.aclose()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                finally:
+                    if pipe := self._transport.get_pipe_transport(fd):
+                        pipe.close()
+
+            if cleanup_error is not None:
+                # Closing the transport on asyncio also handles sending kill
+                self._transport.close()
+                await self.wait()
+                raise cleanup_error
+
+            # If a cancellation is already being propagated, kill the process
+            # instead of waiting for it to exit on its own, as that could take
+            # an arbitrarily long time. Cancellations requested via AnyIO cancel
+            # scopes would interrupt the wait() below anyway, but this also
+            # covers cancellations delivered directly by asyncio which have
+            # already been consumed by the time we get here.
+            if self._process.returncode is None and _cancellation_in_flight():
+                self._transport.close()
 
             scope.shield = False
             try:
