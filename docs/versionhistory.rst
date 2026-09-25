@@ -29,6 +29,11 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Fixed dynamically requesting an async fixture via ``request.getfixturevalue()``
+  from within a running async test or fixture deadlocking the trio backend (and
+  raising ``RuntimeError`` on asyncio) in the pytest plugin; such fixtures are now
+  run in a separate thread with their own event loop
+  (`#1148 <https://github.com/agronholm/anyio/issues/1148>`_)
 
 **4.15.1**
 

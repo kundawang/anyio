@@ -615,10 +615,9 @@ def test_async_fixture_params(testdir: Pytester) -> None:
 
 def test_dynamic_async_fixture_access_does_not_hang(testdir: Pytester) -> None:
     """
-    Test for a situation when an async test or fixture dynamically request an async fixture
-    via request.getfixturevalue() from causing a re-entrant call into the test runner.
-    on trio it will deadlock, on asyncio it raises RuntimeError. This test is to ensure
-    both backends fail with a clear error.
+    Test that dynamically requesting an async fixture via request.getfixturevalue()
+    from inside a running async test or fixture works on both backends and does not
+    hang or raise.
 
     Regression test for https://github.com/agronholm/anyio/issues/1148
     """
@@ -630,20 +629,30 @@ def test_dynamic_async_fixture_access_does_not_hang(testdir: Pytester) -> None:
         async def f():
             return 1
 
+        @pytest.fixture
+        async def gen_f():
+            yield 2
+
+        @pytest.fixture
+        async def outer(request):
+            return request.getfixturevalue("f") + 1
+
         @pytest.mark.anyio
-        async def test_something(request):
-            value = request.getfixturevalue('f')
-            assert value == 1
+        async def test_dynamic_coroutine_fixture(request):
+            assert request.getfixturevalue("f") == 1
+
+        @pytest.mark.anyio
+        async def test_dynamic_asyncgen_fixture(request):
+            assert request.getfixturevalue("gen_f") == 2
+
+        @pytest.mark.anyio
+        async def test_dynamic_fixture_from_async_fixture(outer):
+            assert outer == 2
         """
     )
 
-    result = testdir.runpytest_subprocess(*pytest_args, timeout=3)
-    result.stdout.fnmatch_lines(
-        [
-            "*RuntimeError: Cannot schedule a coroutine in the test runner while another is already running;*"
-        ]
-    )
-    result.assert_outcomes(failed=len(get_available_backends()))
+    result = testdir.runpytest_subprocess(*pytest_args, timeout=30)
+    result.assert_outcomes(passed=len(get_available_backends()) * 3)
 
 
 def test_auto_mode(testdir: Pytester) -> None:

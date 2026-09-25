@@ -3,9 +3,12 @@ from __future__ import annotations
 import dataclasses
 import socket
 import sys
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator, Iterator
 from contextlib import ExitStack, contextmanager
+from functools import partial
 from inspect import isasyncgenfunction, iscoroutinefunction, ismethod
+from queue import Queue
+from threading import Thread
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -18,9 +21,11 @@ from ._core._eventloop import (
     current_async_library,
     get_async_backend,
     reset_current_async_library,
+    run,
     set_current_async_library,
 )
 from ._core._exceptions import iterate_exceptions
+from .to_thread import run_sync
 
 if TYPE_CHECKING:
     from .abc import TestRunner
@@ -82,6 +87,105 @@ def get_runner(
             assert _runner_stack is not None
             _runner_stack.close()
             _runner_stack = _current_runner = None
+
+
+def _run_fixture_in_thread(
+    fixture_func: Callable[..., Coroutine[Any, Any, Any]],
+    kwargs: dict[str, Any],
+    backend_name: str,
+    backend_options: dict[str, Any],
+) -> Any:
+    """
+    Run a coroutine fixture in a separate thread with its own event loop.
+
+    This is used for re-entrant fixture setup (e.g. when an async fixture is
+    dynamically requested via ``request.getfixturevalue()`` from inside a running
+    async test or fixture), where the already running event loop cannot be driven
+    synchronously from the current thread.
+    """
+    outcomes: Queue[tuple[bool, Any]] = Queue()
+
+    def thread_target() -> None:
+        try:
+            fixturevalue = run(
+                partial(fixture_func, **kwargs),
+                backend=backend_name,
+                backend_options=backend_options,
+            )
+        except BaseException as exc:
+            outcomes.put((False, exc))
+        else:
+            outcomes.put((True, fixturevalue))
+
+    thread = Thread(target=thread_target, daemon=True)
+    thread.start()
+    thread.join()
+    success, value = outcomes.get()
+    if success:
+        return value
+
+    raise value
+
+
+def _run_asyncgen_fixture_in_thread(
+    fixture_func: Callable[..., AsyncGenerator[Any, Any]],
+    kwargs: dict[str, Any],
+    backend_name: str,
+    backend_options: dict[str, Any],
+) -> Generator[Any]:
+    """
+    Run an async generator fixture in a separate thread with its own event loop.
+
+    The thread (and its event loop) is kept alive until the fixture is torn down,
+    so that the setup and teardown of the fixture run on the same event loop.
+    """
+    outcomes: Queue[tuple[bool, Any]] = Queue()
+    teardown_request: Queue[None] = Queue()
+
+    async def runner() -> None:
+        asyncgen = fixture_func(**kwargs)
+        try:
+            fixturevalue = await asyncgen.__anext__()
+        except BaseException as exc:
+            outcomes.put((False, exc))
+            return
+
+        outcomes.put((True, fixturevalue))
+
+        # Wait for the main thread to request the fixture teardown
+        await run_sync(teardown_request.get)
+
+        try:
+            await asyncgen.__anext__()
+        except StopAsyncIteration:
+            outcomes.put((True, None))
+        except BaseException as exc:
+            outcomes.put((False, exc))
+        else:
+            await asyncgen.aclose()
+            outcomes.put((False, RuntimeError("Async generator fixture did not stop")))
+
+    def thread_target() -> None:
+        try:
+            run(runner, backend=backend_name, backend_options=backend_options)
+        except BaseException as exc:
+            outcomes.put((False, exc))
+
+    thread = Thread(target=thread_target, daemon=True)
+    thread.start()
+    success, value = outcomes.get()
+    if not success:
+        thread.join()
+        raise value
+
+    try:
+        yield value
+    finally:
+        teardown_request.put(None)
+        success, value = outcomes.get()
+        thread.join()
+        if not success:
+            raise value
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -149,19 +253,23 @@ def pytest_fixture_setup(fixturedef: Any, request: Any) -> Generator[Any]:
             kwargs["request"] = request
 
         with get_runner(backend_name, backend_options) as runner:
-            # re-entrant call into the test runner detected. this happens when an async fixture
-            # is dynamically requested via request.getfixturevalue() from inside a running async
-            # test or fixture. on asyncio this raises RuntimeError: This event loop is already
-            # running, on trio the runner deadlocks - the host loop blocks waiting for the
-            # coroutine to return, but the coroutine is waiting for the host loop. raising here
-            # prevents the hang and gives a consistent error across backends.
             if runner.is_running():
-                raise RuntimeError(
-                    "Cannot schedule a coroutine in the test runner while another is already running; "
-                    "likely caused by request.getfixturevalue() on an async fixture."
-                )
-
-            if isasyncgenfunction(local_func):
+                # Re-entrant call into the test runner: an async fixture is being
+                # dynamically requested (e.g. via request.getfixturevalue()) from
+                # inside a running async test or fixture. The already running event
+                # loop cannot be driven synchronously from here (asyncio raises
+                # "This event loop is already running", while the trio runner
+                # deadlocks), so the fixture is run in a separate thread with its
+                # own event loop instead.
+                if isasyncgenfunction(local_func):
+                    yield from _run_asyncgen_fixture_in_thread(
+                        local_func, kwargs, backend_name, backend_options
+                    )
+                else:
+                    yield _run_fixture_in_thread(
+                        local_func, kwargs, backend_name, backend_options
+                    )
+            elif isasyncgenfunction(local_func):
                 yield from runner.run_asyncgen_fixture(local_func, kwargs)
             else:
                 yield runner.run_fixture(local_func, kwargs)
