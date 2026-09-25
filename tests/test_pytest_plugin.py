@@ -615,10 +615,9 @@ def test_async_fixture_params(testdir: Pytester) -> None:
 
 def test_dynamic_async_fixture_access_does_not_hang(testdir: Pytester) -> None:
     """
-    Test for a situation when an async test or fixture dynamically request an async fixture
-    via request.getfixturevalue() from causing a re-entrant call into the test runner.
-    on trio it will deadlock, on asyncio it raises RuntimeError. This test is to ensure
-    both backends fail with a clear error.
+    Test that dynamically requesting an async fixture via request.getfixturevalue()
+    from inside a running async test or fixture works on both backends, instead of
+    deadlocking (trio) or raising "This event loop is already running" (asyncio).
 
     Regression test for https://github.com/agronholm/anyio/issues/1148
     """
@@ -630,20 +629,27 @@ def test_dynamic_async_fixture_access_does_not_hang(testdir: Pytester) -> None:
         async def f():
             return 1
 
+        @pytest.fixture
+        async def gen_f():
+            yield 2
+
+        @pytest.fixture
+        async def g(request):
+            return request.getfixturevalue("f") + 1
+
         @pytest.mark.anyio
-        async def test_something(request):
-            value = request.getfixturevalue('f')
-            assert value == 1
+        async def test_dynamic_fixture_in_test(request):
+            assert request.getfixturevalue("f") == 1
+            assert request.getfixturevalue("gen_f") == 2
+
+        @pytest.mark.anyio
+        async def test_dynamic_fixture_in_async_fixture(g):
+            assert g == 2
         """
     )
 
-    result = testdir.runpytest_subprocess(*pytest_args, timeout=3)
-    result.stdout.fnmatch_lines(
-        [
-            "*RuntimeError: Cannot schedule a coroutine in the test runner while another is already running;*"
-        ]
-    )
-    result.assert_outcomes(failed=len(get_available_backends()))
+    result = testdir.runpytest_subprocess(*pytest_args, timeout=30)
+    result.assert_outcomes(passed=len(get_available_backends()) * 2)
 
 
 def test_auto_mode(testdir: Pytester) -> None:
