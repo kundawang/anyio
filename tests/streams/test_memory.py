@@ -509,6 +509,56 @@ async def test_send_to_natively_cancelled_receiver() -> None:
         assert receive.receive_nowait() == "hello"
 
 
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_receiver_natively_cancelled_after_send() -> None:
+    """
+    Test that if a task waiting on receive() is cancelled after a sender has already
+    assigned an item to it, the item is not lost but is instead made available to the
+    next receiver.
+
+    """
+    from asyncio import CancelledError, create_task
+
+    send, receive = create_memory_object_stream[str](0)
+    with send, receive:
+        receive_task = create_task(receive.receive())
+        await wait_all_tasks_blocked()  # ensure that the task is waiting to receive
+        send.send_nowait("hello")
+        receive_task.cancel()
+        with pytest.raises(CancelledError):
+            await receive_task
+
+        assert receive.receive_nowait() == "hello"
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_send_to_natively_cancelled_receiver_unbuffered() -> None:
+    """
+    Test that on an unbuffered stream, sending to a receiver with a pending native
+    cancellation raises WouldBlock instead of delivering the item to the cancelled
+    receiver where it would be lost.
+
+    """
+    from asyncio import CancelledError, create_task
+
+    send, receive = create_memory_object_stream[str](0)
+    with send, receive:
+        receive_task = create_task(receive.receive())
+        await wait_all_tasks_blocked()  # ensure that the task is waiting to receive
+        receive_task.cancel()
+        with pytest.raises(WouldBlock):
+            send.send_nowait("hello")
+
+        with pytest.raises(CancelledError):
+            await receive_task
+
+        # The stream must remain usable for subsequent receivers
+        receive_task = create_task(receive.receive())
+        await wait_all_tasks_blocked()
+        send.send_nowait("hello")
+        assert await receive_task == "hello"
+
+
 async def test_memory_object_item_receiver_repr() -> None:
     """
     Test the repr of `MemoryObjectItemReceiver`.

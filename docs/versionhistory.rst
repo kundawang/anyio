@@ -29,6 +29,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Fixed a race condition where an item sent to a memory object stream was lost when
+  the receiving task was cancelled (e.g. via ``asyncio.Task.cancel()``) after the
+  item had been assigned to it but before it could resume and consume it
 
 **4.15.1**
 
