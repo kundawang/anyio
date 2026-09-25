@@ -6,9 +6,10 @@ import math
 import re
 import sys
 import time
+import weakref
 from asyncio import CancelledError
 from collections.abc import AsyncGenerator, Coroutine, Generator
-from contextlib import aclosing
+from contextlib import aclosing, contextmanager
 from contextvars import ContextVar, copy_context
 from inspect import CORO_CLOSED, getcoroutinestate
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -1981,6 +1982,114 @@ async def test_start_return_handle_cancel() -> None:
     ),
 )
 class TestRefcycles:
+    @staticmethod
+    @contextmanager
+    def _gc_disabled() -> Generator[None, None, None]:
+        """
+        Disable the cyclic garbage collector so that the tests can assert that
+        no reference cycles are formed (reference counting alone must be enough
+        to reclaim the objects).
+        """
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            yield
+        finally:
+            if was_enabled:
+                gc.enable()
+
+    async def test_no_reference_cycle_direct_raise(self) -> None:
+        """
+        Test that a child task raising an exception does not leave the task
+        group, the task handle or the raised ExceptionGroup trapped in a
+        reference cycle (exception -> traceback -> frame -> ...).
+        """
+        refs: list[weakref.ReferenceType[Any]] = []
+
+        async def fail() -> None:
+            await checkpoint()
+            raise Exception("task failed")
+
+        async def scenario() -> None:
+            for _ in range(3):
+                try:
+                    async with create_task_group() as tg:
+                        refs.append(weakref.ref(tg))
+                        refs.append(weakref.ref(tg.start_soon(fail)))
+                except BaseExceptionGroup as exc:
+                    refs.append(weakref.ref(exc))
+
+        with self._gc_disabled():
+            await scenario()
+            assert all(ref() is None for ref in refs)
+
+    async def test_no_reference_cycle_nested_exception_group(self) -> None:
+        """
+        Test that a child task raising an ExceptionGroup does not leave the task
+        group or the nested exception groups trapped in a reference cycle.
+        """
+        refs: list[weakref.ReferenceType[Any]] = []
+
+        async def fail() -> None:
+            await checkpoint()
+            raise ExceptionGroup("inner", [Exception("task failed")])
+
+        async def scenario() -> None:
+            for _ in range(3):
+                try:
+                    async with create_task_group() as tg:
+                        refs.append(weakref.ref(tg))
+                        tg.start_soon(fail)
+                except BaseExceptionGroup as exc:
+                    refs.append(weakref.ref(exc))
+                    refs.append(weakref.ref(exc.exceptions[0]))
+
+        with self._gc_disabled():
+            await scenario()
+            assert all(ref() is None for ref in refs)
+
+    async def test_no_reference_cycle_parent_task_raise(self) -> None:
+        """
+        Test that the parent task raising in the task group body (which cancels
+        the child tasks) does not leave the task group or the raised
+        ExceptionGroup trapped in a reference cycle.
+        """
+        refs: list[weakref.ReferenceType[Any]] = []
+
+        async def scenario() -> None:
+            for _ in range(3):
+                try:
+                    async with create_task_group() as tg:
+                        refs.append(weakref.ref(tg))
+                        tg.start_soon(sleep_forever)
+                        raise Exception("host task failed")
+                except BaseExceptionGroup as exc:
+                    refs.append(weakref.ref(exc))
+
+        with self._gc_disabled():
+            await scenario()
+            assert all(ref() is None for ref in refs)
+
+    async def test_no_reference_cycle_cancellation(self) -> None:
+        """
+        Test that cancelling the task group does not leave the task group
+        trapped in a reference cycle involving the CancelledError retrieved
+        from the cancelled child tasks and its traceback.
+        """
+        refs: list[weakref.ReferenceType[TaskGroup]] = []
+
+        async def scenario() -> None:
+            for _ in range(3):
+                with CancelScope() as scope:
+                    async with create_task_group() as tg:
+                        refs.append(weakref.ref(tg))
+                        tg.start_soon(sleep_forever)
+                        scope.cancel()
+
+        with self._gc_disabled():
+            await scenario()
+            assert all(ref() is None for ref in refs)
+
     async def test_exception_refcycles_direct(self) -> None:
         """
         Test that TaskGroup doesn't keep a reference to the raised ExceptionGroup

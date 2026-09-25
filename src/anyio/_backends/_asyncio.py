@@ -780,6 +780,39 @@ else:
     _eager_task_factory_code = None
 
 
+def _get_task_exception(task: asyncio.Task) -> BaseException | None:
+    """
+    Return the exception of a finished task, or ``None`` if it did not raise.
+
+    This needs to be a separate function, called only from the ``task_done()``
+    callback in ``TaskGroup._spawn()``, because retrieving the exception from a
+    cancelled task re-raises the original ``CancelledError``, adding the calling
+    frame to its traceback. This frame is then removed from the traceback, as it
+    would otherwise keep the ``task_done()`` frame (via ``f_back``) and thus the
+    exception itself and the task group alive, forming a reference cycle
+    (exception -> traceback -> frame -> ... -> exception) that only the cyclic
+    garbage collector could reclaim.
+    """
+    try:
+        return task.exception()
+    except CancelledError as exc:
+        # Remove this function's own frame (added by the re-raise above) from
+        # the traceback to break the reference cycle described in the docstring
+        # (note: the traceback must not be stored in a local variable here, as
+        # it would reference this very frame, recreating the cycle)
+        if (
+            exc.__traceback__ is not None
+            and exc.__traceback__.tb_frame.f_code is _get_task_exception.__code__
+        ):
+            exc = exc.with_traceback(exc.__traceback__.tb_next)
+
+        # Unwrap chained cancellations to get the original one
+        while isinstance(exc.__context__, CancelledError):
+            exc = exc.__context__
+
+        return exc
+
+
 class TaskGroup(abc.TaskGroup):
     def __init__(self) -> None:
         self.cancel_scope: CancelScope = CancelScope()
@@ -886,14 +919,7 @@ class TaskGroup(abc.TaskGroup):
                 except asyncio.InvalidStateError:
                     pass
 
-            try:
-                exc = _task.exception()
-            except CancelledError as e:
-                while isinstance(e.__context__, CancelledError):
-                    e = e.__context__
-
-                exc = e
-
+            exc = _get_task_exception(_task)
             if exc is not None:
                 # The future can only be in the cancelled state if the host task was
                 # cancelled, so return immediately instead of adding one more

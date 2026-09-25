@@ -29,6 +29,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Fixed task groups on the asyncio backend forming reference cycles between the
+  exceptions of cancelled child tasks and their tracebacks, which kept task groups
+  and their associated objects alive until a cyclic garbage collection run
 
 **4.15.1**
 
