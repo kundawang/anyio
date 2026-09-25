@@ -752,7 +752,7 @@ class _AsyncioTaskStatus(abc.TaskStatus[T_contra]):
         target_scope: CancelScope,
         spawn_scope: CancelScope,
     ):
-        self._future = future
+        self._future: asyncio.Future | None = future
         self._parent_id = parent_id
         # The eventual parent scope for this spawn_scope
         # (after task_status.started() has been called)
@@ -763,14 +763,15 @@ class _AsyncioTaskStatus(abc.TaskStatus[T_contra]):
     def started(self, value: T_contra | None = None) -> None:
         task = cast(asyncio.Task, current_task())
         _task_states[task].parent_id = self._parent_id
-        if self._future.done():
-            if not self._future.cancelled():
+        future = self._future
+        if future is None or future.done():
+            if future is None or not future.cancelled():
                 raise RuntimeError("called 'started' twice on the same task status")
             else:
                 # Caller of start() was cancelled, nothing to reparent
                 return
 
-        self._future.set_result(value)
+        future.set_result(value)
         self._spawn_scope._reparent(self._target_scope)
 
 
@@ -894,25 +895,36 @@ class TaskGroup(abc.TaskGroup):
 
                 exc = e
 
-            if exc is not None:
-                # The future can only be in the cancelled state if the host task was
-                # cancelled, so return immediately instead of adding one more
-                # CancelledError to the exceptions list
-                if task_status_future is not None and task_status_future.cancelled():
-                    return
+            try:
+                if exc is not None:
+                    # The future can only be in the cancelled state if the host task
+                    # was cancelled, so return immediately instead of adding one more
+                    # CancelledError to the exceptions list
+                    if (
+                        task_status_future is not None
+                        and task_status_future.cancelled()
+                    ):
+                        return
 
-                if task_status_future is None or task_status_future.done():
-                    if not isinstance(exc, CancelledError):
-                        self._exceptions.append(exc)
+                    if task_status_future is None or task_status_future.done():
+                        if not isinstance(exc, CancelledError):
+                            self._exceptions.append(exc)
 
-                    if not self.cancel_scope._effectively_cancelled:
-                        self.cancel_scope.cancel()
-                else:
-                    task_status_future.set_exception(exc)
-            elif task_status_future is not None and not task_status_future.done():
-                task_status_future.set_exception(
-                    RuntimeError("Child exited without calling task_status.started()")
-                )
+                        if not self.cancel_scope._effectively_cancelled:
+                            self.cancel_scope.cancel()
+                    else:
+                        task_status_future.set_exception(exc)
+                elif task_status_future is not None and not task_status_future.done():
+                    task_status_future.set_exception(
+                        RuntimeError(
+                            "Child exited without calling task_status.started()"
+                        )
+                    )
+            finally:
+                # Break the reference cycle between the exception and this frame
+                # (the exception's traceback contains this frame, whose local
+                # variables in turn reference the exception)
+                del exc
 
         if task_status_future is not None:
             parent_id = id(current_task())
@@ -1025,6 +1037,11 @@ class TaskGroup(abc.TaskGroup):
                 with CancelScope(shield=True):
                     await handle.wait()
 
+            # Break the reference cycle between the exception and this frame
+            # (the exception's traceback contains this frame, whose local variables
+            # in turn reference the exception via the future and the task handle)
+            task_status._future = None
+            del future, task_status, coro, handle
             raise
 
         if return_handle:

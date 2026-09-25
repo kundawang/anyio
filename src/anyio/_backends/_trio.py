@@ -289,7 +289,7 @@ class TaskGroup(abc.TaskGroup):
         name: object = None,
         return_handle: Literal[False, True] = False,
     ) -> Any:
-        handle: TaskHandle[T_co]
+        handle: TaskHandle[T_co] | None = None
 
         async def run_coro_with_task_status(
             *, task_status: trio.TaskStatus[Any]
@@ -307,9 +307,18 @@ class TaskGroup(abc.TaskGroup):
 
         self._check_active()
         final_name = get_callable_name(func, name)
-        start_value = await self._nursery.start(
-            run_coro_with_task_status, name=final_name
-        )
+        try:
+            start_value = await self._nursery.start(
+                run_coro_with_task_status, name=final_name
+            )
+        except BaseException:
+            # Break the reference cycle between the exception and this frame
+            # (the exception's traceback contains frames that reference the task
+            # handle, which in turn references the exception)
+            handle = None
+            raise
+
+        assert handle is not None
         if return_handle:
             handle._start_value = start_value
             return handle
