@@ -29,6 +29,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Fixed memory object streams losing an item when the task waiting to receive it was
+  cancelled after the item had been delivered to it but before it could resume; the
+  item is now passed on to the next receiver in line or put back in the buffer
 
 **4.15.1**
 

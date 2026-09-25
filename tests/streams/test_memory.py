@@ -509,6 +509,51 @@ async def test_send_to_natively_cancelled_receiver() -> None:
         assert receive.receive_nowait() == "hello"
 
 
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_native_cancel_during_receive() -> None:
+    """
+    Test that if a task waiting on receive() is natively cancelled after an item has
+    been delivered to it but before it has had a chance to resume, the item is not
+    lost but made available to subsequent receivers.
+
+    """
+    from asyncio import CancelledError, create_task
+
+    send, receive = create_memory_object_stream[str]()
+    with send, receive:
+        receive_task = create_task(receive.receive())
+        await wait_all_tasks_blocked()  # ensure that the task is waiting to receive
+        send.send_nowait("hello")
+        receive_task.cancel()
+        with pytest.raises(CancelledError):
+            await receive_task
+
+        assert receive.receive_nowait() == "hello"
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_native_cancelled_receiver_passes_item_to_next() -> None:
+    """
+    Test that if a task waiting on receive() is natively cancelled after an item has
+    been delivered to it, the item is passed on to the next task waiting to receive,
+    if any.
+
+    """
+    from asyncio import CancelledError, create_task
+
+    send, receive = create_memory_object_stream[str]()
+    with send, receive:
+        cancelled_task = create_task(receive.receive())
+        receiver_task = create_task(receive.receive())
+        await wait_all_tasks_blocked()  # ensure that the tasks are waiting to receive
+        send.send_nowait("hello")
+        cancelled_task.cancel()
+        with pytest.raises(CancelledError):
+            await cancelled_task
+
+        assert await receiver_task == "hello"
+
+
 async def test_memory_object_item_receiver_repr() -> None:
     """
     Test the repr of `MemoryObjectItemReceiver`.

@@ -124,7 +124,30 @@ class MemoryObjectReceiveStream(ObjectReceiveStream[T_co], Generic[T_co]):
 
             try:
                 await receive_event.wait()
-            finally:
+            except BaseException:
+                self._state.waiting_receivers.pop(receive_event, None)
+
+                # If a sender already delivered an item to us, hand it over to the
+                # next receiver in line or put it back in the buffer, as it would
+                # otherwise be lost
+                try:
+                    item = receiver.item
+                except AttributeError:
+                    pass
+                else:
+                    while self._state.waiting_receivers:
+                        event, next_receiver = self._state.waiting_receivers.popitem(
+                            last=False
+                        )
+                        if not next_receiver.task_info.has_pending_cancellation():
+                            next_receiver.item = item
+                            event.set()
+                            break
+                    else:
+                        self._state.buffer.appendleft(item)
+
+                raise
+            else:
                 self._state.waiting_receivers.pop(receive_event, None)
 
             try:
