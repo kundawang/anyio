@@ -65,6 +65,7 @@ from anyio import (
     wait_socket_writable,
     wait_writable,
 )
+from anyio._backends._asyncio import SocketStream as AsyncIOSocketStream
 from anyio._core._eventloop import get_async_backend
 from anyio.abc import (
     AnyByteStream,
@@ -307,6 +308,58 @@ class TestTCPStream:
                             arrived = b"z" in data
 
                 assert b"c" not in received
+
+    @pytest.mark.parametrize("anyio_backend", asyncio_params)
+    async def test_cancelled_send_does_not_write_to_paused_transport(
+        self,
+        server_sock: socket.socket,
+        server_addr: tuple[str, int],
+        mocker: MockerFixture,
+    ) -> None:
+        """
+        Verify, with a simulated paused transport, that a send cancelled while
+        waiting for the transport to resume does not cause a later send to hand
+        its data to the still paused transport.
+        """
+        async with await connect_tcp(*server_addr) as stream:
+            assert isinstance(stream, AsyncIOSocketStream)
+            client, _ = server_sock.accept()
+            with client:
+                client.setblocking(False)
+                transport = mocker.patch.object(
+                    stream, "_transport", wraps=stream._transport
+                )
+
+                async def send_and_cancel(item: bytes) -> None:
+                    async with create_task_group() as tg:
+                        tg.start_soon(stream.send, item)
+                        await wait_all_tasks_blocked()
+                        tg.cancel_scope.cancel()
+
+                # Simulate flow control kicking in: the transport stays paused
+                # until resume_writing() is called
+                stream._protocol.pause_writing()
+
+                # Neither the cancelled send nor the one after it may write to
+                # the paused transport
+                await send_and_cancel(b"stale")
+                await send_and_cancel(b"discarded")
+                transport.write.assert_not_called()
+
+                # Once resumed, the next send goes through, and the peer receives
+                # exactly that data, with nothing stale arriving before it
+                stream._protocol.resume_writing()
+                await stream.send(b"fresh")
+                transport.write.assert_called_once_with(b"fresh")
+
+                received = bytearray()
+                while len(received) < len(b"fresh"):
+                    try:
+                        received += client.recv(65536)
+                    except BlockingIOError:
+                        await wait_readable(client)
+
+                assert received == b"fresh"
 
     async def test_send_receive(
         self, server_sock: socket.socket, server_addr: tuple[str, int]
