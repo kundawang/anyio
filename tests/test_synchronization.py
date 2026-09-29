@@ -446,6 +446,25 @@ class TestCondition:
             condition.notify()
             condition.notify_all()
 
+    async def test_notify_delivery_with_shared_lock(self) -> None:
+        notified = False
+
+        async def waiter() -> None:
+            nonlocal notified
+            async with condition:
+                await condition.wait()
+                notified = True
+
+        lock = Lock()
+        condition = Condition(lock)
+        async with create_task_group() as tg:
+            tg.start_soon(waiter)
+            await wait_all_tasks_blocked()
+            async with lock:
+                condition.notify()
+
+        assert notified
+
     async def test_notify_no_lock(self) -> None:
         condition = Condition()
         with pytest.raises(
